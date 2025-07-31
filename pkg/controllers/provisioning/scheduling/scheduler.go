@@ -223,7 +223,7 @@ type Results struct {
 func (r Results) Record(ctx context.Context, recorder events.Recorder, cluster *state.Cluster) {
 	// Report failures and nominations
 	for p, err := range r.PodErrors {
-		if IsReservedOfferingError(err) {
+		if IsReservedOfferingError(err) || IsDRAError(err) {
 			continue
 		}
 		log.FromContext(ctx).WithValues("Pod", klog.KObj(p)).Error(err, "could not schedule pod")
@@ -262,6 +262,12 @@ func (r Results) Record(ctx context.Context, recorder events.Recorder, cluster *
 func (r Results) ReservedOfferingErrors() map[*corev1.Pod]error {
 	return lo.PickBy(r.PodErrors, func(_ *corev1.Pod, err error) bool {
 		return IsReservedOfferingError(err)
+	})
+}
+
+func (r Results) DRAErrors() map[*corev1.Pod]error {
+	return lo.PickBy(r.PodErrors, func(_ *corev1.Pod, err error) bool {
+		return IsDRAError(err)
 	})
 }
 
@@ -410,11 +416,11 @@ func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) error {
 		if err == nil {
 			return nil
 		}
-		// We should only relax the pod's requirements when the error is not a reserved offering error because the pod may be
+		// We should only relax the pod's requirements when the error is not a reserved offering error or DRA error because the pod may be
 		// able to schedule later without relaxing constraints. This could occur in this scheduling run, if other NodeClaims
 		// release the required reservations when constrained, or in subsequent runs. For an example, reference the following
 		// test: "shouldn't relax preferences when a pod fails to schedule due to a reserved offering error".
-		if IsReservedOfferingError(err) {
+		if IsReservedOfferingError(err) || IsDRAError(err) {
 			return err
 		}
 		// Eventually we won't be able to relax anymore and this while loop will exit
@@ -451,10 +457,10 @@ func (s *Scheduler) updateCachedPodData(p *corev1.Pod) {
 }
 
 func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
-	// Check if pod has DRA requirements - if so, return immediately as DRA is not yet supported
+	// Check if pod has DRA requirements - if so, return DRA error as DRA is not yet supported
 	if s.cachedPodData[pod.UID].IsDRAEnabled {
 		log.FromContext(ctx).V(1).WithValues("Pod", klog.KObj(pod)).Info("skipping pod scheduling, Dynamic Resource Allocation (DRA) is not yet supported by Karpenter")
-		return nil
+		return NewDRAError(fmt.Errorf("pod has Dynamic Resource Allocation requirements that are not yet supported by Karpenter"))
 	}
 
 	// first try to schedule against an in-flight real node
