@@ -457,8 +457,8 @@ func (s *Scheduler) updateCachedPodData(p *corev1.Pod) {
 }
 
 func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
-	// Check if pod has DRA requirements - if so, return DRA error as DRA is not yet supported
-	if s.cachedPodData[pod.UID].IsDRAEnabled {
+	// Check if pod has DRA requirements - if so, return DRA error when SkipDRAScheduling is enabled
+	if s.cachedPodData[pod.UID].IsDRAEnabled && karpopts.FromContext(ctx).FeatureGates.SkipDRAScheduling {
 		log.FromContext(ctx).V(1).WithValues("Pod", klog.KObj(pod)).Info("skipping pod scheduling, Dynamic Resource Allocation (DRA) is not yet supported by Karpenter")
 		return NewDRAError(fmt.Errorf("pod has Dynamic Resource Allocation requirements that are not yet supported by Karpenter"))
 	}
