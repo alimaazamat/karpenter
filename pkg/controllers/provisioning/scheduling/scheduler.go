@@ -182,10 +182,10 @@ func NewScheduler(
 }
 
 type PodData struct {
-	Requests           corev1.ResourceList
-	Requirements       scheduling.Requirements
-	StrictRequirements scheduling.Requirements
-	IsDRAEnabled       bool
+	Requests                 corev1.ResourceList
+	Requirements             scheduling.Requirements
+	StrictRequirements       scheduling.Requirements
+	HasResourceClaimRequests bool
 }
 
 type Scheduler struct {
@@ -210,6 +210,25 @@ type Scheduler struct {
 	numConcurrentReconciles int
 }
 
+// DRAError indicates a pod will not be attempted to be scheduled because it has Dynamic Resource Allocation requirements
+// that are not yet supported by Karpenter
+type DRAError struct {
+	error
+}
+
+func NewDRAError(err error) DRAError {
+	return DRAError{error: err}
+}
+
+func IsDRAError(err error) bool {
+	draErr := &DRAError{}
+	return errors.As(err, draErr)
+}
+
+func (e DRAError) Unwrap() error {
+	return e.error
+}
+
 // Results contains the results of the scheduling operation
 type Results struct {
 	NewNodeClaims []*NodeClaim
@@ -223,7 +242,12 @@ type Results struct {
 func (r Results) Record(ctx context.Context, recorder events.Recorder, cluster *state.Cluster) {
 	// Report failures and nominations
 	for p, err := range r.PodErrors {
-		if IsReservedOfferingError(err) || IsDRAError(err) {
+		if IsReservedOfferingError(err) {
+			continue
+		}
+		if IsDRAError(err) {
+			recorder.Publish(PodFailedToScheduleEvent(p, err))
+			log.FromContext(ctx).WithValues("Pod", klog.KObj(p)).Info("skipping pod with Dynamic Resource Allocation requirements, not yet supported by Karpenter")
 			continue
 		}
 		log.FromContext(ctx).WithValues("Pod", klog.KObj(p)).Error(err, "could not schedule pod")
@@ -416,11 +440,16 @@ func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) error {
 		if err == nil {
 			return nil
 		}
-		// We should only relax the pod's requirements when the error is not a reserved offering error or DRA error because the pod may be
+		// We should only relax the pod's requirements when the error is not a reserved offering error because the pod may be
 		// able to schedule later without relaxing constraints. This could occur in this scheduling run, if other NodeClaims
 		// release the required reservations when constrained, or in subsequent runs. For an example, reference the following
 		// test: "shouldn't relax preferences when a pod fails to schedule due to a reserved offering error".
-		if IsReservedOfferingError(err) || IsDRAError(err) {
+		if IsReservedOfferingError(err) {
+			return err
+		}
+		// DRA errors are permanent while the SkipDRAScheduling flag is enabled, so we shouldn't attempt to relax
+		// pod requirements as we don't want to schedule the pod.
+		if IsDRAError(err) {
 			return err
 		}
 		// Eventually we won't be able to relax anymore and this while loop will exit
@@ -449,17 +478,16 @@ func (s *Scheduler) updateCachedPodData(p *corev1.Pod) {
 		strictRequirements = scheduling.NewStrictPodRequirements(p)
 	}
 	s.cachedPodData[p.UID] = &PodData{
-		Requests:           resources.RequestsForPods(p),
-		Requirements:       requirements,
-		StrictRequirements: strictRequirements,
-		IsDRAEnabled:       pod.HasDRARequirements(p),
+		Requests:                 resources.RequestsForPods(p),
+		Requirements:             requirements,
+		StrictRequirements:       strictRequirements,
+		HasResourceClaimRequests: pod.HasDRARequirements(p),
 	}
 }
 
 func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 	// Check if pod has DRA requirements - if so, return DRA error when SkipDRAScheduling is enabled
-	if s.cachedPodData[pod.UID].IsDRAEnabled && karpopts.FromContext(ctx).FeatureGates.SkipDRAScheduling {
-		log.FromContext(ctx).V(1).WithValues("Pod", klog.KObj(pod)).Info("skipping pod scheduling, Dynamic Resource Allocation (DRA) is not yet supported by Karpenter")
+	if s.cachedPodData[pod.UID].HasResourceClaimRequests && karpopts.FromContext(ctx).FeatureGates.SkipDRAScheduling {
 		return NewDRAError(fmt.Errorf("pod has Dynamic Resource Allocation requirements that are not yet supported by Karpenter"))
 	}
 
@@ -653,6 +681,10 @@ func (s *Scheduler) calculateExistingNodeClaims(stateNodes []*state.StateNode, d
 		taints := node.Taints()
 		var daemons []*corev1.Pod
 		for _, p := range daemonSetPods {
+			// Exclude daemon pods with DRA requirements till Karpenter supports DRA
+			if pod.HasDRARequirements(p) {
+				continue
+			}
 			if err := scheduling.Taints(taints).ToleratesPod(p); err != nil {
 				continue
 			}
@@ -715,7 +747,13 @@ func parallelizeUntil(workers, pieces int, doWorkPiece func(int) bool) {
 // getDaemonOverhead determines the overhead for each NodeClaimTemplate required for daemons to schedule for any node provisioned by the NodeClaimTemplate
 func getDaemonOverhead(nodeClaimTemplates []*NodeClaimTemplate, daemonSetPods []*corev1.Pod) map[*NodeClaimTemplate]corev1.ResourceList {
 	return lo.SliceToMap(nodeClaimTemplates, func(nct *NodeClaimTemplate) (*NodeClaimTemplate, corev1.ResourceList) {
-		return nct, resources.RequestsForPods(lo.Filter(daemonSetPods, func(p *corev1.Pod, _ int) bool { return isDaemonPodCompatible(nct, p) })...)
+		return nct, resources.RequestsForPods(lo.Filter(daemonSetPods, func(p *corev1.Pod, _ int) bool {
+			// Exclude daemon pods with DRA requirements till Karpenter supports DRA
+			if pod.HasDRARequirements(p) {
+				return false
+			}
+			return isDaemonPodCompatible(nct, p)
+		})...)
 	})
 }
 
@@ -724,8 +762,14 @@ func getDaemonHostPortUsage(nodeClaimTemplates []*NodeClaimTemplate, daemonSetPo
 	nctToOccupiedPorts := map[*NodeClaimTemplate]*scheduling.HostPortUsage{}
 	for _, nct := range nodeClaimTemplates {
 		hostPortUsage := scheduling.NewHostPortUsage()
-		// gather compatible DaemonSet pods for the NodeClaimTemplate
-		for _, pod := range lo.Filter(daemonSetPods, func(p *corev1.Pod, _ int) bool { return isDaemonPodCompatible(nct, p) }) {
+		// gather compatible DaemonSet pods for the NodeClaimTemplate, excluding those with DRA requirements
+		for _, pod := range lo.Filter(daemonSetPods, func(p *corev1.Pod, _ int) bool {
+			// Exclude daemon pods with DRA requirements till Karpenter supports DRA
+			if pod.HasDRARequirements(p) {
+				return false
+			}
+			return isDaemonPodCompatible(nct, p)
+		}) {
 			hostPortUsage.Add(pod, scheduling.GetHostPorts(pod))
 		}
 		nctToOccupiedPorts[nct] = hostPortUsage
