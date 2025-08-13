@@ -447,7 +447,7 @@ func (s *Scheduler) trySchedule(ctx context.Context, p *corev1.Pod) error {
 		if IsReservedOfferingError(err) {
 			return err
 		}
-		// DRA errors are permanent while the SkipDRAScheduling flag is enabled, so we shouldn't attempt to relax
+		// DRA errors are permanent while the IgnoreDRARequests flag is enabled, so we shouldn't attempt to relax
 		// pod requirements as we don't want to schedule the pod.
 		if IsDRAError(err) {
 			return err
@@ -486,8 +486,8 @@ func (s *Scheduler) updateCachedPodData(p *corev1.Pod) {
 }
 
 func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
-	// Check if pod has DRA requirements - if so, return DRA error when SkipDRAScheduling is enabled
-	if s.cachedPodData[pod.UID].HasResourceClaimRequests && karpopts.FromContext(ctx).FeatureGates.SkipDRAScheduling {
+	// Check if pod has DRA requirements - if so, return DRA error when IgnoreDRARequests is enabled
+	if s.cachedPodData[pod.UID].HasResourceClaimRequests && karpopts.FromContext(ctx).IgnoreDRARequests {
 		return NewDRAError(fmt.Errorf("pod has Dynamic Resource Allocation requirements that are not yet supported by Karpenter"))
 	}
 
