@@ -4599,112 +4599,145 @@ var _ = Context("Scheduling", func() {
 	})
 
 	Describe("Dynamic Resource Allocation (DRA)", func() {
-		It("should not create NodeClaims for DRA pods and return DRA error", func() {
-			nodePool := test.NodePool()
-			ExpectApplied(ctx, env.Client, nodePool)
+		DescribeTable("should handle DRA pods correctly",
+			func(testCase string, podOptions test.PodOptions, expectNodeClaims bool, expectDRAError bool) {
+				nodePool := test.NodePool()
+				ExpectApplied(ctx, env.Client, nodePool)
 
-			// Create a pod with DRA requirements (container consumes ResourceClaims)
-			DRAEnabledPod := &corev1.Pod{
+				// Create the test pod with specified options
+				pod := test.Pod(podOptions)
+
+				scheduler, err := prov.NewScheduler(ctx, []*corev1.Pod{pod}, nil)
+				Expect(err).ToNot(HaveOccurred())
+				results, err := scheduler.Solve(ctx, []*corev1.Pod{pod})
+				Expect(err).ToNot(HaveOccurred())
+
+				if expectNodeClaims {
+					// Should create NodeClaims for non-DRA pods
+					Expect(results.NewNodeClaims).To(HaveLen(1))
+					Expect(results.PodErrors).To(BeEmpty())
+				} else {
+					// Should not create NodeClaims for DRA pods
+					Expect(results.NewNodeClaims).To(BeEmpty())
+				}
+
+				if expectDRAError {
+					// Verify DRA errors are correctly identified and filtered
+					draErrors := results.DRAErrors()
+					Expect(draErrors).To(HaveLen(1))
+					Expect(draErrors).To(HaveKey(pod))
+				} else {
+					// Verify no DRA errors for non-DRA pods
+					Expect(results.DRAErrors()).To(BeEmpty())
+				}
+			},
+			Entry("container with resource claims", "container-dra", test.PodOptions{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "dra-pod",
+					Name:      "dra-container-pod",
 					Namespace: "default",
-					UID:       "dra-pod-uid",
+					UID:       "dra-container-pod-uid",
 				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:  "gpu-container",
-							Image: "nvidia/cuda:latest",
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("1"),
-									corev1.ResourceMemory: resource.MustParse("1Gi"),
-								},
-								Claims: []corev1.ResourceClaim{
-									{Name: "gpu-claim"},
-								},
+				Image: "nvidia/cuda:latest",
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("1"),
+						corev1.ResourceMemory: resource.MustParse("1Gi"),
+					},
+				},
+				ContainerResourceClaims: []corev1.ResourceClaim{
+					{Name: "gpu-claim"},
+				},
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodScheduled, Reason: corev1.PodReasonUnschedulable, Status: corev1.ConditionFalse},
+				},
+				Phase: corev1.PodPending,
+			}, false, true),
+			Entry("init container with resource claims", "init-container-dra", test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "dra-init-container-pod",
+					Namespace: "default",
+					UID:       "dra-init-container-pod-uid",
+				},
+				Image: "nginx:latest",
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("1"),
+						corev1.ResourceMemory: resource.MustParse("1Gi"),
+					},
+				},
+				InitContainers: []corev1.Container{
+					{
+						Image: "nvidia/cuda:latest",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("500m"),
+								corev1.ResourceMemory: resource.MustParse("512Mi"),
 							},
 						},
 					},
 				},
-				Status: corev1.PodStatus{
-					Conditions: []corev1.PodCondition{
-						{Type: corev1.PodScheduled, Reason: corev1.PodReasonUnschedulable, Status: corev1.ConditionFalse},
-					},
-					Phase: corev1.PodPending,
+				InitContainerResourceClaims: []corev1.ResourceClaim{
+					{Name: "gpu-init-claim"},
 				},
-			}
-
-			scheduler, err := prov.NewScheduler(ctx, []*corev1.Pod{DRAEnabledPod}, nil)
-			Expect(err).ToNot(HaveOccurred())
-			results, err := scheduler.Solve(ctx, []*corev1.Pod{DRAEnabledPod})
-			Expect(err).ToNot(HaveOccurred())
-
-			// Verify no NodeClaims were created
-			Expect(results.NewNodeClaims).To(BeEmpty())
-
-			// Verify the error is specifically a DRA error
-			Expect(results.PodErrors).To(HaveLen(1))
-			Expect(results.PodErrors).To(HaveKey(DRAEnabledPod))
-			err, exists := results.PodErrors[DRAEnabledPod]
-			Expect(exists).To(BeTrue())
-			Expect(scheduling.IsDRAError(err)).To(BeTrue())
-			Expect(err.Error()).To(ContainSubstring("Dynamic Resource Allocation"))
-
-			// Verify DRAErrors() filtering works correctly
-			draErrors := results.DRAErrors()
-			Expect(draErrors).To(HaveLen(1))
-			Expect(draErrors).To(HaveKey(DRAEnabledPod))
-		})
-
-		It("should create NodeClaims for non-DRA pods", func() {
-			nodePool := test.NodePool()
-			ExpectApplied(ctx, env.Client, nodePool)
-
-			// Create a non-DRA pod without DRA requirements (container doesn't consume ResourceClaims)
-			DRADisabledPod := &corev1.Pod{
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodScheduled, Reason: corev1.PodReasonUnschedulable, Status: corev1.ConditionFalse},
+				},
+				Phase: corev1.PodPending,
+			}, false, true),
+			Entry("pod with both container and init container resource claims", "both-dra", test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "dra-both-pod",
+					Namespace: "default",
+					UID:       "dra-both-pod-uid",
+				},
+				Image: "nvidia/cuda:latest",
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("1"),
+						corev1.ResourceMemory: resource.MustParse("1Gi"),
+					},
+				},
+				ContainerResourceClaims: []corev1.ResourceClaim{
+					{Name: "gpu-claim"},
+				},
+				InitContainers: []corev1.Container{
+					{
+						Image: "busybox:latest",
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("250m"),
+								corev1.ResourceMemory: resource.MustParse("256Mi"),
+							},
+						},
+					},
+				},
+				InitContainerResourceClaims: []corev1.ResourceClaim{
+					{Name: "storage-init-claim"},
+				},
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodScheduled, Reason: corev1.PodReasonUnschedulable, Status: corev1.ConditionFalse},
+				},
+				Phase: corev1.PodPending,
+			}, false, true),
+			Entry("non-DRA pod without resource claims", "non-dra", test.PodOptions{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "non-dra-pod",
 					Namespace: "default",
 					UID:       "non-dra-pod-uid",
 				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:  "web-container",
-							Image: "nginx:latest",
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("1"),
-									corev1.ResourceMemory: resource.MustParse("1Gi"),
-								},
-							},
-						},
+				Image: "nginx:latest",
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("1"),
+						corev1.ResourceMemory: resource.MustParse("1Gi"),
 					},
 				},
-				Status: corev1.PodStatus{
-					Conditions: []corev1.PodCondition{
-						{Type: corev1.PodScheduled, Reason: corev1.PodReasonUnschedulable, Status: corev1.ConditionFalse},
-					},
-					Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodScheduled, Reason: corev1.PodReasonUnschedulable, Status: corev1.ConditionFalse},
 				},
-			}
-
-			scheduler, err := prov.NewScheduler(ctx, []*corev1.Pod{DRADisabledPod}, nil)
-			Expect(err).ToNot(HaveOccurred())
-			results, err := scheduler.Solve(ctx, []*corev1.Pod{DRADisabledPod})
-			Expect(err).ToNot(HaveOccurred())
-
-			// Verify a NodeClaim was created for the non-DRA pod
-			Expect(results.NewNodeClaims).To(HaveLen(1))
-
-			// Verify no pod errors
-			Expect(results.PodErrors).To(BeEmpty())
-
-			// Verify no DRA errors
-			draErrors := results.DRAErrors()
-			Expect(draErrors).To(BeEmpty())
-		})
+				Phase: corev1.PodPending,
+			}, true, false),
+		)
 	})
 })
 
