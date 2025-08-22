@@ -62,6 +62,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
+	"sigs.k8s.io/karpenter/pkg/utils/pod"
 	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
 
@@ -4767,6 +4768,50 @@ var _ = Context("Scheduling", func() {
 				Phase: corev1.PodPending,
 			}, true, false),
 		)
+
+		It("should handle DaemonSet pods with DRA requirements based on IgnoreDRARequests flag value", func() {
+			nodePool := test.NodePool()
+			ExpectApplied(ctx, env.Client, nodePool)
+
+			draDaemonPod := test.Pod(test.PodOptions{
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("2"),
+						corev1.ResourceMemory: resource.MustParse("2Gi"),
+					},
+				},
+				ContainerResourceClaims: []corev1.ResourceClaim{
+					{Name: "gpu-claim"},
+				},
+			})
+
+			nonDRADaemonPod := test.Pod(test.PodOptions{
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("500m"),
+						corev1.ResourceMemory: resource.MustParse("500Mi"),
+					},
+				},
+			})
+
+			Expect(pod.HasDRARequirements(draDaemonPod)).To(BeTrue())
+			Expect(pod.HasDRARequirements(nonDRADaemonPod)).To(BeFalse())
+			nct := scheduling.NewNodeClaimTemplate(nodePool)
+			daemonPods := []*corev1.Pod{draDaemonPod, nonDRADaemonPod}
+
+			// When IgnoreDRARequests = true (default) then DRA daemon pods should be excluded from overhead
+			overhead := scheduling.GetDaemonOverheadForTest(ctx, nct, daemonPods)
+			expectedCPUWithoutDRA := resource.MustParse("500m") // Only non-DRA daemon with 500m
+			actualCPU := overhead[corev1.ResourceCPU]
+			Expect(actualCPU.Cmp(expectedCPUWithoutDRA)).To(Equal(0))
+
+			// When IgnoreDRARequests = false then DRA daemon pods should be included in overhead
+			ctxWithDRAEnabled := options.ToContext(ctx, &options.Options{IgnoreDRARequests: false})
+			overheadWithDRA := scheduling.GetDaemonOverheadForTest(ctxWithDRAEnabled, nct, daemonPods)
+			expectedCPUWithDRA := resource.MustParse("2500m") // non-DRA daemon with 500m + DRA daemon with 2000m
+			actualCPUWithDRA := overheadWithDRA[corev1.ResourceCPU]
+			Expect(actualCPUWithDRA.Cmp(expectedCPUWithDRA)).To(Equal(0))
+		})
 	})
 })
 

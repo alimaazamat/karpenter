@@ -162,8 +162,8 @@ func NewScheduler(
 		nodeClaimTemplates:  templates,
 		topology:            topology,
 		cluster:             cluster,
-		daemonOverhead:      getDaemonOverhead(templates, daemonSetPods),
-		daemonHostPortUsage: getDaemonHostPortUsage(templates, daemonSetPods),
+		daemonOverhead:      getDaemonOverhead(ctx, templates, daemonSetPods),
+		daemonHostPortUsage: getDaemonHostPortUsage(ctx, templates, daemonSetPods),
 		cachedPodData:       map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
 		recorder:            recorder,
 		preferences:         &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
@@ -177,7 +177,7 @@ func NewScheduler(
 		minValuesPolicy:         minValuesPolicy,
 		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
 	}
-	s.calculateExistingNodeClaims(stateNodes, daemonSetPods)
+	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods)
 	return s
 }
 
@@ -674,34 +674,59 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 	return multierr.Combine(errs...)
 }
 
-func (s *Scheduler) calculateExistingNodeClaims(stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod) {
+func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod) {
 	// create our existing nodes
 	for _, node := range stateNodes {
-		// Calculate any daemonsets that should schedule to the inflight node
 		taints := node.Taints()
-		var daemons []*corev1.Pod
-		for _, p := range daemonSetPods {
-			// Exclude daemon pods with DRA requirements till Karpenter supports DRA
-			if pod.HasDRARequirements(p) {
-				continue
-			}
-			if err := scheduling.Taints(taints).ToleratesPod(p); err != nil {
-				continue
-			}
-			if err := scheduling.NewLabelRequirements(node.Labels()).Compatible(scheduling.NewStrictPodRequirements(p)); err != nil {
-				continue
-			}
+		daemons := s.getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
+		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...)))
+		s.updateRemainingResources(node)
+	}
+	s.sortExistingNodes()
+}
+
+// getCompatibleDaemonPods filters daemon pods that can schedule to the given node
+func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node *state.StateNode, taints []corev1.Taint, daemonSetPods []*corev1.Pod) []*corev1.Pod {
+	var daemons []*corev1.Pod
+	for _, p := range daemonSetPods {
+		if s.shouldSkipDaemonPod(ctx, p) {
+			continue
+		}
+		if s.isDaemonPodCompatibleWithNode(p, taints, node.Labels()) {
 			daemons = append(daemons, p)
 		}
-		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...)))
-
-		// We don't use the status field and instead recompute the remaining resources to ensure we have a consistent view
-		// of the cluster during scheduling.  Depending on how node creation falls out, this will also work for cases where
-		// we don't create NodeClaim resources.
-		if _, ok := s.remainingResources[node.Labels()[v1.NodePoolLabelKey]]; ok {
-			s.remainingResources[node.Labels()[v1.NodePoolLabelKey]] = resources.Subtract(s.remainingResources[node.Labels()[v1.NodePoolLabelKey]], node.Capacity())
-		}
 	}
+	return daemons
+}
+
+// shouldSkipDaemonPod checks if a daemon pod should be skipped due to DRA requirements
+func (s *Scheduler) shouldSkipDaemonPod(ctx context.Context, p *corev1.Pod) bool {
+	return pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests
+}
+
+// isDaemonPodCompatibleWithNode checks if a daemon pod is compatible with the node
+func (s *Scheduler) isDaemonPodCompatibleWithNode(p *corev1.Pod, taints []corev1.Taint, nodeLabels map[string]string) bool {
+	if err := scheduling.Taints(taints).ToleratesPod(p); err != nil {
+		return false
+	}
+	if err := scheduling.NewLabelRequirements(nodeLabels).Compatible(scheduling.NewStrictPodRequirements(p)); err != nil {
+		return false
+	}
+	return true
+}
+
+// updateRemainingResources updates the remaining resources for the node's nodepool
+func (s *Scheduler) updateRemainingResources(node *state.StateNode) {
+	// We don't use the status field and instead recompute the remaining resources to ensure we have a consistent view
+	// of the cluster during scheduling.  Depending on how node creation falls out, this will also work for cases where
+	// we don't create NodeClaim resources.
+	if _, ok := s.remainingResources[node.Labels()[v1.NodePoolLabelKey]]; ok {
+		s.remainingResources[node.Labels()[v1.NodePoolLabelKey]] = resources.Subtract(s.remainingResources[node.Labels()[v1.NodePoolLabelKey]], node.Capacity())
+	}
+}
+
+// sortExistingNodes sorts existing nodes with initialized nodes first
+func (s *Scheduler) sortExistingNodes() {
 	// Order the existing nodes for scheduling with initialized nodes first
 	// This is done specifically for consolidation where we want to make sure we schedule to initialized nodes
 	// before we attempt to schedule uninitialized ones
@@ -745,11 +770,11 @@ func parallelizeUntil(workers, pieces int, doWorkPiece func(int) bool) {
 }
 
 // getDaemonOverhead determines the overhead for each NodeClaimTemplate required for daemons to schedule for any node provisioned by the NodeClaimTemplate
-func getDaemonOverhead(nodeClaimTemplates []*NodeClaimTemplate, daemonSetPods []*corev1.Pod) map[*NodeClaimTemplate]corev1.ResourceList {
+func getDaemonOverhead(ctx context.Context, nodeClaimTemplates []*NodeClaimTemplate, daemonSetPods []*corev1.Pod) map[*NodeClaimTemplate]corev1.ResourceList {
 	return lo.SliceToMap(nodeClaimTemplates, func(nct *NodeClaimTemplate) (*NodeClaimTemplate, corev1.ResourceList) {
 		return nct, resources.RequestsForPods(lo.Filter(daemonSetPods, func(p *corev1.Pod, _ int) bool {
-			// Exclude daemon pods with DRA requirements till Karpenter supports DRA
-			if pod.HasDRARequirements(p) {
+			// Exclude daemon pods with DRA requirements when IgnoreDRARequests is enabled
+			if pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests {
 				return false
 			}
 			return isDaemonPodCompatible(nct, p)
@@ -758,14 +783,14 @@ func getDaemonOverhead(nodeClaimTemplates []*NodeClaimTemplate, daemonSetPods []
 }
 
 // getDaemonHostPortUsage determines requested host ports for DaemonSet pods, given a NodeClaimTemplate
-func getDaemonHostPortUsage(nodeClaimTemplates []*NodeClaimTemplate, daemonSetPods []*corev1.Pod) map[*NodeClaimTemplate]*scheduling.HostPortUsage {
+func getDaemonHostPortUsage(ctx context.Context, nodeClaimTemplates []*NodeClaimTemplate, daemonSetPods []*corev1.Pod) map[*NodeClaimTemplate]*scheduling.HostPortUsage {
 	nctToOccupiedPorts := map[*NodeClaimTemplate]*scheduling.HostPortUsage{}
 	for _, nct := range nodeClaimTemplates {
 		hostPortUsage := scheduling.NewHostPortUsage()
-		// gather compatible DaemonSet pods for the NodeClaimTemplate, excluding those with DRA requirements
+		// gather compatible DaemonSet pods for the NodeClaimTemplate
 		for _, pod := range lo.Filter(daemonSetPods, func(p *corev1.Pod, _ int) bool {
-			// Exclude daemon pods with DRA requirements till Karpenter supports DRA
-			if pod.HasDRARequirements(p) {
+			// Exclude daemon pods with DRA requirements when IgnoreDRARequests is enabled
+			if pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests {
 				return false
 			}
 			return isDaemonPodCompatible(nct, p)
@@ -775,6 +800,12 @@ func getDaemonHostPortUsage(nodeClaimTemplates []*NodeClaimTemplate, daemonSetPo
 		nctToOccupiedPorts[nct] = hostPortUsage
 	}
 	return nctToOccupiedPorts
+}
+
+// GetDaemonOverheadForTest is a test helper function that exposes getDaemonOverhead for unit testing
+func GetDaemonOverheadForTest(ctx context.Context, nct *NodeClaimTemplate, daemonSetPods []*corev1.Pod) corev1.ResourceList {
+	overhead := getDaemonOverhead(ctx, []*NodeClaimTemplate{nct}, daemonSetPods)
+	return overhead[nct]
 }
 
 // isDaemonPodCompatible determines if the daemon pod is compatible with the NodeClaimTemplate for daemon scheduling
