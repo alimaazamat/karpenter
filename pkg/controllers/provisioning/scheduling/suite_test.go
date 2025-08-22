@@ -62,7 +62,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
-	"sigs.k8s.io/karpenter/pkg/utils/pod"
 	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
 
@@ -4773,44 +4772,64 @@ var _ = Context("Scheduling", func() {
 			nodePool := test.NodePool()
 			ExpectApplied(ctx, env.Client, nodePool)
 
+			// daemon pod with DRA requirements with large resource request
 			draDaemonPod := test.Pod(test.PodOptions{
 				ResourceRequirements: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("2"),
-						corev1.ResourceMemory: resource.MustParse("2Gi"),
-					},
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
 				},
-				ContainerResourceClaims: []corev1.ResourceClaim{
-					{Name: "gpu-claim"},
-				},
+				ContainerResourceClaims: []corev1.ResourceClaim{{Name: "gpu-claim"}}, // DRA requirement
 			})
-
+			draDaemonPod.OwnerReferences = []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "DaemonSet",
+				Name:       "dra-daemon",
+			}}
+			// daemon pod with DRA requirements with small resource request
 			nonDRADaemonPod := test.Pod(test.PodOptions{
 				ResourceRequirements: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceCPU:    resource.MustParse("500m"),
-						corev1.ResourceMemory: resource.MustParse("500Mi"),
-					},
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")},
+				},
+			})
+			nonDRADaemonPod.OwnerReferences = []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "DaemonSet",
+				Name:       "non-dra-daemon",
+			}}
+
+			testPod := test.UnschedulablePod(test.PodOptions{
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
 				},
 			})
 
-			Expect(pod.HasDRARequirements(draDaemonPod)).To(BeTrue())
-			Expect(pod.HasDRARequirements(nonDRADaemonPod)).To(BeFalse())
-			nct := scheduling.NewNodeClaimTemplate(nodePool)
-			daemonPods := []*corev1.Pod{draDaemonPod, nonDRADaemonPod}
-
 			// When IgnoreDRARequests = true (default) then DRA daemon pods should be excluded from overhead
-			overhead := scheduling.GetDaemonOverheadForTest(ctx, nct, daemonPods)
-			expectedCPUWithoutDRA := resource.MustParse("500m") // Only non-DRA daemon with 500m
-			actualCPU := overhead[corev1.ResourceCPU]
-			Expect(actualCPU.Cmp(expectedCPUWithoutDRA)).To(Equal(0))
+			ctx1 := options.ToContext(ctx, test.Options(test.OptionsFields{IgnoreDRARequests: lo.ToPtr(true)}))
+			topology1, err := scheduling.NewTopology(ctx1, env.Client, cluster, nil, []*v1.NodePool{nodePool},
+				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes}, []*corev1.Pod{testPod})
+			Expect(err).ToNot(HaveOccurred())
+			scheduler1 := scheduling.NewScheduler(ctx1, env.Client, []*v1.NodePool{nodePool}, cluster, nil, topology1,
+				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes},
+				[]*corev1.Pod{nonDRADaemonPod, draDaemonPod}, events.NewRecorder(&record.FakeRecorder{}), fakeClock)
+			results1, err := scheduler1.Solve(ctx1, []*corev1.Pod{testPod})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(results1.NewNodeClaims).To(HaveLen(1))
 
 			// When IgnoreDRARequests = false then DRA daemon pods should be included in overhead
-			ctxWithDRAEnabled := options.ToContext(ctx, &options.Options{IgnoreDRARequests: false})
-			overheadWithDRA := scheduling.GetDaemonOverheadForTest(ctxWithDRAEnabled, nct, daemonPods)
-			expectedCPUWithDRA := resource.MustParse("2500m") // non-DRA daemon with 500m + DRA daemon with 2000m
-			actualCPUWithDRA := overheadWithDRA[corev1.ResourceCPU]
-			Expect(actualCPUWithDRA.Cmp(expectedCPUWithDRA)).To(Equal(0))
+			ctx2 := options.ToContext(ctx, test.Options(test.OptionsFields{IgnoreDRARequests: lo.ToPtr(false)}))
+			topology2, err := scheduling.NewTopology(ctx2, env.Client, cluster, nil, []*v1.NodePool{nodePool},
+				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes}, []*corev1.Pod{testPod})
+			Expect(err).ToNot(HaveOccurred())
+			scheduler2 := scheduling.NewScheduler(ctx2, env.Client, []*v1.NodePool{nodePool}, cluster, nil, topology2,
+				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes},
+				[]*corev1.Pod{nonDRADaemonPod, draDaemonPod}, events.NewRecorder(&record.FakeRecorder{}), fakeClock)
+			results2, err := scheduler2.Solve(ctx2, []*corev1.Pod{testPod})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(results2.NewNodeClaims).To(HaveLen(1))
+
+			// Compare selected instance sizes - when IgnoreDRARequests = true then we should've landed on a smaller instance
+			node1CPU := results1.NewNodeClaims[0].InstanceTypeOptions[0].Capacity[corev1.ResourceCPU]
+			node2CPU := results2.NewNodeClaims[0].InstanceTypeOptions[0].Capacity[corev1.ResourceCPU]
+			Expect(node2CPU.MilliValue()).To(BeNumerically(">", node1CPU.MilliValue()))
 		})
 	})
 })

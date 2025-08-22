@@ -802,12 +802,6 @@ func getDaemonHostPortUsage(ctx context.Context, nodeClaimTemplates []*NodeClaim
 	return nctToOccupiedPorts
 }
 
-// GetDaemonOverheadForTest is a test helper function that exposes getDaemonOverhead for unit testing
-func GetDaemonOverheadForTest(ctx context.Context, nct *NodeClaimTemplate, daemonSetPods []*corev1.Pod) corev1.ResourceList {
-	overhead := getDaemonOverhead(ctx, []*NodeClaimTemplate{nct}, daemonSetPods)
-	return overhead[nct]
-}
-
 // isDaemonPodCompatible determines if the daemon pod is compatible with the NodeClaimTemplate for daemon scheduling
 func isDaemonPodCompatible(nodeClaimTemplate *NodeClaimTemplate, pod *corev1.Pod) bool {
 	preferences := &Preferences{}
